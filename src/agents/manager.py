@@ -4,7 +4,7 @@ from uagents.setup import fund_agent_if_low
 from src.models.decision_models import DecisionInput, DecisionOutput
 
 
-alice = Agent(
+manager = Agent(
     name="Alice",
     seed="khavaioghgjabougrvbosubvisgvgjfkf",
     port=8000,
@@ -12,7 +12,7 @@ alice = Agent(
 )
 
 
-@alice.on_rest_post("/decision", decision_output=DecisionOutput)
+@manager.on_rest_post("/decision", decision_output=DecisionOutput)
 async def handle_decision(ctx: Context, msg: DecisionInput) -> DecisionOutput:
     ctx.logger.info("Received input data via REST")
 
@@ -30,5 +30,5 @@ async def handle_decision(ctx: Context, msg: DecisionInput) -> DecisionOutput:
 
 
 if __name__ == "__main__":
-    fund_agent_if_low(alice.wallet.address())
-    alice.run()
+    fund_agent_if_low(manager.wallet.address())
+    manager.run()

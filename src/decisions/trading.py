@@ -72,7 +72,6 @@ def decide_energy_distribution(
         - buy_from_grid: Energy to buy from grid (kWh)
         - take_from_storage: Energy to take from storage (kWh)
     """
-    import numpy as np
     
     # Get current hour prices
     current_prices = get_grid_prices_for_hour(grid_prices, hour)

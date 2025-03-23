@@ -1,6 +1,8 @@
 import pandas as pd
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict
 import logging
+import numpy as np
+
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -45,10 +47,11 @@ def decide_energy_distribution(
     grid_prices: pd.DataFrame,
     hour: int,
     p2p_price: float,
-    look_ahead_hours: int = 3
-) -> Tuple[float, float, float, float, float]:
+    look_ahead_hours: int = 24  # Extended to look at full day
+) -> Tuple[float, float, float, float]:
     """
-    Make a comprehensive decision about energy distribution.
+    Make a comprehensive decision about energy distribution with P2P price considerations
+    and price spike awareness.
     
     Args:
         production: Energy produced in the current hour (kWh)
@@ -58,36 +61,61 @@ def decide_energy_distribution(
         grid_prices: DataFrame containing grid prices
         hour: Current hour (0-23)
         p2p_price: Current peer-to-peer trading price
-        token_balance: Current token balance for P2P trading
         look_ahead_hours: Number of hours to look ahead for price forecasting
         
     Returns:
         Tuple of:
         - energy_to_storage: Energy to add to storage (kWh)
-        - sell_to_p2p: Energy to sell to P2P network (kWh)
         - sell_to_grid: Energy to sell to grid (kWh)
         - buy_from_grid: Energy to buy from grid (kWh)
         - take_from_storage: Energy to take from storage (kWh)
     """
+    import numpy as np
+    
     # Get current hour prices
     current_prices = get_grid_prices_for_hour(grid_prices, hour)
     grid_purchase_price = current_prices["purchase"]
     grid_sale_price = current_prices["sale"]
     
-    # Look ahead at future prices
-    future_prices = []
-    for i in range(1, look_ahead_hours + 1):
-        future_hour = (hour + i) % 24
-        future_price = get_grid_prices_for_hour(grid_prices, future_hour)
-        future_prices.append({
-            "hour": future_hour,
-            "buy_price": future_price["purchase"],
-            "sell_price": future_price["sale"]
-        })
+    # Get all 24 hours of price data for better analysis
+    all_hours = list(range(24))
+    all_prices = [get_grid_prices_for_hour(grid_prices, h) for h in all_hours]
+    all_purchase_prices = [p["purchase"] for p in all_prices]
+    all_sale_prices = [p["sale"] for p in all_prices]
     
-    # Find the best future buying and selling prices
-    best_future_buy = min(future_prices, key=lambda x: x['buy_price'], default={"buy_price": grid_purchase_price})
-    best_future_sell = max(future_prices, key=lambda x: x['sell_price'], default={"sell_price": grid_sale_price})
+    # Calculate price statistics
+    mean_purchase_price = np.mean(all_purchase_prices)
+    std_purchase_price = np.std(all_purchase_prices)
+    mean_sale_price = np.mean(all_sale_prices)
+    
+    # Define price spike thresholds (purchase price > mean + 1 std dev)
+    purchase_spike_threshold = mean_purchase_price + std_purchase_price
+    
+    # Look ahead to detect upcoming price spikes
+    upcoming_hours = [(hour + i) % 24 for i in range(1, look_ahead_hours + 1)]
+    upcoming_prices = [get_grid_prices_for_hour(grid_prices, h) for h in upcoming_hours]
+    
+    # Identify upcoming price spikes within the look-ahead window
+    upcoming_spikes = []
+    for i, price_data in enumerate(upcoming_prices):
+        if price_data["purchase"] > purchase_spike_threshold:
+            upcoming_spikes.append({
+                "hour": upcoming_hours[i],
+                "price": price_data["purchase"],
+                "hours_away": i + 1
+            })
+    
+    # Calculate hours until the next price spike
+    hours_to_next_spike = float('inf')
+    if upcoming_spikes:
+        hours_to_next_spike = upcoming_spikes[0]["hours_away"]
+    
+    # Calculate optimal sell hours (when grid sale price is high)
+    high_sale_price_threshold = np.percentile(all_sale_prices, 75)
+    upcoming_good_sell_hours = [
+        h for i, h in enumerate(upcoming_hours) 
+        if all_prices[h]["sale"] > high_sale_price_threshold
+    ]
     
     # Calculate energy balance
     energy_balance = production - consumption  # Positive = surplus, Negative = deficit
@@ -101,18 +129,36 @@ def decide_energy_distribution(
     # Case 1: We have energy surplus
     if energy_balance > 0:
         available_surplus = energy_balance
-        
-        # Should we store energy for future use?
-        # Store if future buying prices are higher or if we expect higher P2P demand
         storage_capacity_left = max_storage - current_storage
-        better_prices_coming = best_future_sell["sell_price"] > grid_sale_price
         
-        if better_prices_coming and storage_capacity_left > 0:
-            # Store energy for future high-price hours
+        # Calculate storage urgency factor based on proximity to next price spike
+        # Higher urgency means we prioritize storage more
+        if hours_to_next_spike < float('inf'):
+            # Exponential decay function: urgency increases as we get closer to spike
+            storage_urgency = np.exp(-0.1 * hours_to_next_spike) 
+        else:
+            storage_urgency = 0.1  # Base storage urgency when no spikes detected
+        
+        # Storage capacity target increases as we approach a price spike
+        target_storage_percentage = min(0.9, 0.5 + storage_urgency)
+        target_storage_level = max_storage * target_storage_percentage
+        
+        # Determine if we should prioritize storage
+        storage_deficit = max(0, target_storage_level - current_storage)
+        is_p2p_price_competitive = p2p_price > grid_sale_price * 0.9  # 10% tolerance
+        
+        should_prioritize_storage = (
+            (storage_deficit > 0 and hours_to_next_spike < 12) or  # Spike approaching
+            is_p2p_price_competitive or                            # P2P price is good
+            (len(upcoming_good_sell_hours) > 0 and storage_deficit > 0)  # Good sell opportunity coming
+        )
+        
+        if should_prioritize_storage and storage_capacity_left > 0:
+            # Store energy - based on urgency and available capacity
             energy_to_storage = min(available_surplus, storage_capacity_left)
             available_surplus -= energy_to_storage
         
-        # Sell to grid
+        # Sell remaining surplus to grid
         if available_surplus > 0:
             sell_to_grid = available_surplus
     
@@ -120,18 +166,40 @@ def decide_energy_distribution(
     else:
         energy_needed = -energy_balance  # Make positive for easier handling
         
-        # Should we take from storage or buy from grid?
-        # Take from storage if current grid prices are high compared to future
-        grid_prices_will_drop = best_future_buy["buy_price"] < grid_purchase_price
+        # Determine if current hour is a price spike
+        is_current_price_spike = grid_purchase_price > purchase_spike_threshold
         
-        if current_storage > 0 and not grid_prices_will_drop:
-            # Use storage since grid prices won't get better soon
-            take_from_storage = min(current_storage, energy_needed)
+        # Determine if we should use storage based on current prices and upcoming spikes
+        should_use_storage = (
+            is_current_price_spike or                    # Current prices are high
+            (hours_to_next_spike > 6) or                 # No spikes coming soon
+            (current_storage > 0.8 * max_storage)        # Storage is relatively full
+        )
+        
+        if should_use_storage and current_storage > 0:
+            # If in a price spike, use more storage; otherwise, be conservative
+            storage_usage_cap = current_storage if is_current_price_spike else current_storage * 0.5
+            take_from_storage = min(storage_usage_cap, energy_needed)
             energy_needed -= take_from_storage
         
         # Buy remaining needs from grid
         if energy_needed > 0:
+            # If prices are very low compared to average, consider buying extra for storage
+            is_price_very_low = grid_purchase_price < mean_purchase_price * 0.8
+            storage_space_available = max_storage - current_storage
+            
+            # Basic energy need
             buy_from_grid = energy_needed
+            
+            # If price is very low and we have upcoming spikes, buy extra for storage
+            if is_price_very_low and hours_to_next_spike < 12 and storage_space_available > 0:
+                # Calculate how much extra to buy based on price advantage
+                price_advantage_ratio = (mean_purchase_price - grid_purchase_price) / mean_purchase_price
+                extra_buy = min(storage_space_available, price_advantage_ratio * 10)  # Scale factor of 10 kWh
+                
+                # Add extra energy to storage
+                energy_to_storage += extra_buy
+                buy_from_grid += extra_buy
     
     # Ensure we don't have negative values (safety check)
     energy_to_storage = max(0, energy_to_storage)

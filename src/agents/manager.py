@@ -71,7 +71,8 @@ async def handle_decision(ctx: Context, msg: DecisionInput) -> DecisionOutput:
             max_storage=total_capacity,
             grid_prices=grid_prices,
             hour=msg.hour,
-            p2p_price=msg.p2p_base_price
+            p2p_price=msg.p2p_base_price,
+            look_ahead_hours=12
         )
         
         # Calculate the cost/profit of the decision

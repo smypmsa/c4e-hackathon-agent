@@ -72,7 +72,8 @@ async def handle_decision(ctx: Context, msg: DecisionInput) -> DecisionOutput:
             grid_prices=grid_prices,
             hour=msg.hour,
             p2p_price=msg.p2p_base_price,
-            look_ahead_hours=12
+            look_ahead_hours=24,
+            enable_proactive_buying=True
         )
         
         # Calculate the cost/profit of the decision

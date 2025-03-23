@@ -47,7 +47,8 @@ def decide_energy_distribution(
     grid_prices: pd.DataFrame,
     hour: int,
     p2p_price: float,
-    look_ahead_hours: int = 24  # Extended to look at full day
+    look_ahead_hours: int = 24,  # Extended to look at full day
+    enable_proactive_buying: bool = True  # New parameter to enable/disable proactive buying
 ) -> Tuple[float, float, float, float]:
     """
     Make a comprehensive decision about energy distribution with P2P price considerations
@@ -62,6 +63,7 @@ def decide_energy_distribution(
         hour: Current hour (0-23)
         p2p_price: Current peer-to-peer trading price
         look_ahead_hours: Number of hours to look ahead for price forecasting
+        enable_proactive_buying: Flag to enable proactive buying before price spikes
         
     Returns:
         Tuple of:
@@ -145,7 +147,7 @@ def decide_energy_distribution(
         
         # Determine if we should prioritize storage
         storage_deficit = max(0, target_storage_level - current_storage)
-        is_p2p_price_competitive = p2p_price > grid_sale_price * 0.9  # 10% tolerance
+        is_p2p_price_competitive = p2p_price < grid_sale_price * 0.9  # 10% tolerance
         
         should_prioritize_storage = (
             (storage_deficit > 0 and hours_to_next_spike < 12) or  # Spike approaching
@@ -201,6 +203,19 @@ def decide_energy_distribution(
                 energy_to_storage += extra_buy
                 buy_from_grid += extra_buy
     
+    # Apply proactive buying strategy if enabled
+    if enable_proactive_buying:
+        extra_grid_buy, extra_storage = calculate_proactive_buying(
+            current_storage, 
+            max_storage, 
+            grid_purchase_price, 
+            mean_purchase_price, 
+            upcoming_spikes, 
+            energy_to_storage
+        )
+        buy_from_grid += extra_grid_buy
+        energy_to_storage += extra_storage
+    
     # Ensure we don't have negative values (safety check)
     energy_to_storage = max(0, energy_to_storage)
     sell_to_grid = max(0, sell_to_grid)
@@ -208,6 +223,94 @@ def decide_energy_distribution(
     take_from_storage = max(0, take_from_storage)
     
     return energy_to_storage, sell_to_grid, buy_from_grid, take_from_storage
+
+def calculate_proactive_buying(
+    current_storage: float,
+    max_storage: float,
+    current_price: float,
+    mean_price: float,
+    upcoming_spikes: list,
+    current_to_storage: float
+) -> Tuple[float, float]:
+    """
+    Calculate proactive energy buying from grid before price spikes.
+    This function implements a strategy to buy energy when prices are
+    relatively low, in anticipation of upcoming price spikes.
+    
+    Args:
+        current_storage: Current energy in storage (kWh)
+        max_storage: Maximum storage capacity (kWh)
+        current_price: Current grid purchase price
+        mean_price: Mean purchase price over the forecast period
+        upcoming_spikes: List of upcoming price spikes with hour, price, and hours_away
+        current_to_storage: Energy already allocated to storage in main function
+        
+    Returns:
+        Tuple of:
+        - extra_grid_buy: Additional energy to buy from grid (kWh)
+        - extra_to_storage: Additional energy to store (kWh)
+    """
+    # If there are no upcoming spikes, don't buy proactively
+    if not upcoming_spikes:
+        return 0.0, 0.0
+    
+    # Calculate available storage space (considering what's already being stored)
+    available_storage = max_storage - current_storage - current_to_storage
+    
+    # If storage is already full or nearly full, don't buy more
+    if available_storage < 1.0:  # Threshold of 1 kWh
+        return 0.0, 0.0
+    
+    # Calculate price advantage: how much cheaper current price is vs mean
+    price_advantage = mean_price - current_price
+    price_advantage_ratio = price_advantage / mean_price
+    
+    # Only buy if there's a significant price advantage
+    if price_advantage_ratio <= 0.05:  # At least 5% cheaper than mean
+        return 0.0, 0.0
+    
+    # Get the first upcoming spike information
+    next_spike = upcoming_spikes[0]
+    hours_to_spike = next_spike["hours_away"]
+    spike_price = next_spike["price"]
+    
+    # Calculate the price difference between spike and current price
+    spike_to_current_ratio = spike_price / current_price
+    
+    # Calculate buying aggressiveness based on:
+    # 1. How soon the spike will occur
+    # 2. How severe the spike is compared to current price
+    # 3. Current price advantage compared to mean
+    
+    # Time factor: more aggressive as spike approaches, but not too close
+    # Optimal buying window is between 2-12 hours before spike
+    if hours_to_spike < 2 or hours_to_spike > 12:
+        time_factor = 0.3
+    else:
+        # Peaked at middle of window (around 7 hours before spike)
+        time_factor = 1.0 - abs(hours_to_spike - 7) / 5
+    
+    # Price advantage factor: more aggressive with larger advantage
+    price_factor = min(1.0, spike_to_current_ratio / 2)
+    
+    # Combine factors to determine buying aggressiveness (0-1 scale)
+    buying_factor = time_factor * price_factor * price_advantage_ratio
+    
+    # Calculate base amount to buy - more aggressive as price advantage increases
+    # and as spike approaches within optimal window
+    base_amount = 5.0  # Base amount in kWh
+    scaled_amount = base_amount * buying_factor * spike_to_current_ratio
+    
+    # Scale based on storage capacity
+    capacity_factor = min(1.0, available_storage / 20.0)  # Scale up to 20 kWh
+    
+    # Calculate the final amount to buy
+    extra_energy = min(scaled_amount * capacity_factor, available_storage)
+    
+    # Safety limit - cap at 50% of available storage in one go
+    extra_energy = min(extra_energy, available_storage * 0.5)
+    
+    return extra_energy, extra_energy
 
 def calculate_cost(
     buy_from_grid: float,
